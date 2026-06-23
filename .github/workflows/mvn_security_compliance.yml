@@ -155,8 +155,8 @@ jobs:
         id: pipeline_scan
         run: |
           java -jar pipeline-scan.jar \
-            --veracode_api_id "${{ secrets.VERACODE_API_ID }}" \
-            --veracode_api_key "${{ secrets.VERACODE_API_KEY }}" \
+            --veracode_api_id "${{ secrets.VERACODE_API_KEY_ID }}" \
+            --veracode_api_key "${{ secrets.VERACODE_API_KEY_SECRET }}" \
             --file "app/target/verademo.war" \
             --fail_on_severity="Very High, High" \
             --issue_details true \
@@ -173,7 +173,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-scan-results
-          path: results.*
+          path: |
+            results.txt
+            results.json
+            filtered_results.json
           retention-days: 90
           if-no-files-found: error
 
