@@ -1,0 +1,228 @@
+name: "Security & Legal Compliance Pipeline"
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  # =====================================================================
+  # Build & Package
+  # Produces the deployable .war artifact for SAST pipeline scanning.
+  # Runs in parallel with SCA (SCA only needs compile, not package).
+  # =====================================================================
+  build:
+    name: "Build & Package"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout Source"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: "Setup Java"
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12  # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: "Package Application"
+        working-directory: app
+        run: mvn package -B -q -DskipTests
+        # mvn package = validate → compile → test → package.
+        # -DskipTests avoids redundant test execution in this job;
+        # tests should run in a dedicated CI job.
+        # Produces app/target/*.war for Veracode Pipeline Scan.
+
+      - name: "Upload Build Artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: app/target/*.war
+          retention-days: 5
+
+  # =====================================================================
+  # SCA, License & SBOM  (unchanged — runs in parallel with build)
+  # =====================================================================
+  veracode-sca:
+    name: "SCA, License & SBOM"
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Source & Build
+      # -----------------------------------------------------------------------
+      - name: "Checkout Source"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: "Setup Java"
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12  # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: "Compile Project (required for Vulnerable Methods analysis)"
+        working-directory: app
+        run: mvn compile -B -q
+        # -B = batch mode (non-interactive, clean CI output)
+        # -q = quiet (suppress download noise)
+        # This produces compiled .class files that the Maven Native Dep
+        # collector needs to build a call graph for vulnerable methods.
+
+      # -----------------------------------------------------------------------
+      # Veracode SCA Scan
+      # -----------------------------------------------------------------------
+      - name: "Validate SCA Token"
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.VERACODE_SCA_TOKEN }}" ]; then
+            echo "::error::VERACODE_SCA_TOKEN secret is not set."
+            exit 1
+          fi
+
+      - name: "Install & Scan With Veracode SCA Agent"
+        id: sca_scan
+        shell: bash
+        env:
+          SRCCLR_API_TOKEN: ${{ secrets.VERACODE_SCA_TOKEN }}
+        run: |
+          set -o pipefail
+          curl -sSL https://download.sourceclear.com/ci.sh | sh -s -- scan \
+            --recursive \
+            --update-advisor \
+            --allow-dirty 2>&1 | tee sca_output.txt
+        continue-on-error: true
+
+      - name: "Block on Hard Threshold Failures"
+        if: steps.sca_scan.outcome == 'failure'
+        run: |
+          echo "::error::SCA scan reported findings at or above the configured threshold."
+          echo "Review sca_output.txt and the Veracode platform for details."
+          exit 1
+      
+      # -----------------------------------------------------------------------
+      # Artifact Archival
+      # -----------------------------------------------------------------------
+      - name: "Archive Scan Output & SLA Report"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-compliance-artifacts
+          path: |
+            sca_output.txt
+            sca_sla_report.json
+
+  # =====================================================================
+  # SAST Pipeline Scan
+  # Depends on build job for the packaged .war artifact.
+  # Runs in parallel with SCA after build completes.
+  # On PRs, the action automatically comments with findings.
+  # =====================================================================
+  veracode-pipeline-scan:
+    name: "SAST Pipeline Scan"
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      scan_outcome: ${{ steps.pipeline_scan.outcome }}
+    steps:
+      - name: "Checkout Source"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        # Needed to access baseline file stored in the repository.
+        # Also enables the action's automatic PR comment feature.
+
+      - name: "Download Build Artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: app/target/
+      
+      - name: "Setup Java"
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12  # v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      
+      - name: "Download Pipeline Scanner"
+        run: |
+          curl -sSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -o pipeline-scan-LATEST.zip pipeline-scan.jar
+          rm pipeline-scan-LATEST.zip
+     
+      - name: "Veracode Pipeline Scan"
+        id: pipeline_scan
+        run: |
+          java -jar pipeline-scan.jar \
+            --veracode_api_id "${{ secrets.VERACODE_API_ID }}" \
+            --veracode_api_key "${{ secrets.VERACODE_API_KEY }}" \
+            --file "app/target/verademo.war" \
+            --fail_on_severity="Very High, High" \
+            --issue_details true \
+            --summary_output true \
+            --summary_output_file results.txt \
+            --json_output_file results.json \
+            --filtered_json_output_file filtered_results.json \
+            --project_name "${{ github.repository }}" \
+            --project_ref "${{ github.ref }}" 
+        continue-on-error: true
+
+      - name: "Upload Pipeline Scan Results"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-scan-results
+          path: |
+            results.txt
+            results.json
+            filtered_results.json
+          retention-days: 90
+          if-no-files-found: error
+
+# -----------------------------------------------------------------------
+# Veracode Fix
+# -----------------------------------------------------------------------
+  veracode-fix:
+    runs-on: ubuntu-latest
+    needs: veracode-pipeline-scan
+    permissions:
+      contents: read
+      pull-requests: write
+    name: Veracode Fix
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: "Download Pipeline Scan Results"
+        uses: actions/download-artifact@v4
+        with:
+          name: pipeline-scan-results
+
+      - name: "Create Fixes from Static Findings"
+        id: convert
+        uses: Veracode/veracode-fix@main
+        continue-on-error: true
+        with:
+          inputFile: filtered_results.json
+          vid: ${{ secrets.VERACODE_API_KEY_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY_SECRET }}
+          files: all
+          cwe: '80,89,113,117,159,209,327,331,404,597,611'
+          prComment: true
+          fixType: batch
+  # -----------------------------------------------------------------------
+  # Explicit Severity Gate
+  # -----------------------------------------------------------------------
+  sast-gate:
+    name: "SAST Severity Gate"
+    needs: [veracode-pipeline-scan, veracode-fix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Block on SAST Severity Threshold"
+        if: needs.veracode-pipeline-scan.outputs.scan_outcome == 'failure'
+        run: |
+          echo "::error::Pipeline scan detected SAST flaws at or above the configured severity threshold (Very High, High)."
+          echo "Review the pipeline-scan-results artifact and the Veracode platform for details."
+          exit 1
