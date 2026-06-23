@@ -211,10 +211,10 @@ jobs:
           cwe: '89'
           prComment: true
           fixType: 'batch'
-          codeSuggestion: false
-          createPR: true
+          #codeSuggestion: false
+          #createPR: true
           debug: true
-          useGitHubApp: 'false'
+          #useGitHubApp: 'false'
   # -----------------------------------------------------------------------
   # Explicit Severity Gate
   # -----------------------------------------------------------------------
